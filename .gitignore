@@ -1,0 +1,7 @@
+venv/
+
+.crossnote/
+
+data/raw/
+
+__pycache__/
