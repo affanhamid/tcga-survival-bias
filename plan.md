@@ -418,11 +418,51 @@ rather than biological.
 
 ### 3.5 Model Comparison
 
-For each cancer type, compare Model A vs Model B using:
-- `az.compare()` with LOO-CV (ArviZ)
-- Report ELPD difference and standard error
-- A positive ELPD difference for Model B = site adjustment improves
-  predictive accuracy = site carries real information beyond genomics
+The predictive comparison must be **site-preserved**, because the entire
+thesis is that site leaks. Standard leave-one-*patient*-out (LOO-CV via
+`az.loo` / `az.compare`) keeps every site in the training fold, so it
+leaks site signal across the split and *understates* the effect — do NOT
+use it as the primary metric.
+
+**Primary: leave-one-site-out (LOSO) CV with Harrell's C-index.**
+For each cancer type:
+- Group patients by TSS. Hold out one site, fit Model A and Model B on the
+  remaining sites, predict a risk score on the held-out site, then
+  accumulate out-of-fold predictions across all sites.
+- Risk score = posterior-mean linear predictor η = β·x. For Model B on a
+  held-out *unseen* site, set the site intercept u_s to its prior mean (0)
+  — the new site's u_s is unidentified, so this evaluates genomic
+  discrimination only (which is the fair question: does site-adjusted
+  training yield genomic coefficients that generalise to new sites?).
+- Compute the pooled Harrell C-index (scikit-survival) over the
+  concatenated out-of-fold predictions, separately for each model.
+- A higher LOSO C-index for Model B = site adjustment yields genomic
+  signal that generalises better to unseen sites = the naive model's
+  apparent skill was partly site leakage.
+- Report the C-index gap (B − A) with a bootstrap CI over patients.
+
+**Fold construction.**
+- *Pure LOSO (preferred):* each site is its own fold, so there is nothing
+  to balance — the pooled out-of-fold C-index is unaffected by the wildly
+  unequal site sizes in TCGA. No optimization required. Cost: ~30+ model
+  fits per cohort (feasible with nutpie).
+- *k-fold site-blocked (compute-saving fallback):* if 30+ fits per cohort
+  is too slow at pan-cancer scale, bin sites into ~5 folds. Folds must then
+  be *balanced* (size + event proportion) while keeping each site intact —
+  this is Howard et al.'s **preserved-site cross-validation**, who solve the
+  site→fold assignment as a **convex optimization / quadratic program**
+  (tool: `fmhoward/PreservedSiteCV`; equalizes the proportion of
+  patients with/without the outcome across folds; perfect stratification in
+  32/58 outcomes). A greedy bin-packing heuristic (descending site size into
+  the currently-smallest fold, tie-broken on event count) is an adequate
+  lighter-weight substitute at our scale.
+
+**Secondary (in-sample fit only): LOO-CV / ELPD via `az.compare()`.**
+Report alongside, explicitly labelled as patient-level (NOT
+site-preserved) — a within-cohort fit comparison, not evidence about
+generalisation to new sites. Note: the censored likelihood uses
+`pm.Potential`, so per-observation log-likelihood must be emitted
+explicitly for `az.loo` to work.
 
 ---
 
@@ -501,9 +541,10 @@ tcga-site-genomics-survival/
 - [ ] ICC per cancer type — ranked bar chart with 95% HDIs
 - [ ] Three-component ICC decomposition (site / genomic / residual)
 - [ ] Gene attenuation ranking — top 20 attenuated genes across cohorts
-- [ ] LOO-CV comparison Model A vs B per cancer type
-- [ ] Kaplan-Meier validation: do the high/low risk groups from Model B
-      separate better than Model A?
+- [ ] Leave-one-site-out C-index comparison Model A vs B per cancer type
+      (primary); patient-level LOO-CV/ELPD as a secondary in-sample check
+- [ ] Kaplan-Meier validation on the leave-one-site-out risk predictions:
+      do the high/low risk groups from Model B separate better than Model A?
 - **Deliverable:** All paper figures
 
 #### Stage 4 — Paper (1-2 weeks)
@@ -532,9 +573,12 @@ Named points = top 10 most attenuated genes.
 Forest plot: ELPD difference (Model B - Model A) per cancer type
 with 95% CI. Positive = site adjustment improves prediction.
 
-**Figure 4 — Survival discrimination**
-C-index comparison: Model A vs Model B under site-preserved CV,
-per cancer type. (Your existing pipeline from the first project.)
+**Figure 4 — Survival discrimination (site-preserved)**
+Harrell C-index, Model A vs Model B, under **leave-one-site-out CV**,
+per cancer type. Forest / paired plot of the C-index gap (B − A) with
+bootstrap CIs. Positive = site adjustment improves generalisation to
+unseen sites. (Adapt the C-index pipeline from the first project, but
+swap random/patient-level folds for site-blocked folds.)
 
 ---
 
