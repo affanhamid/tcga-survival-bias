@@ -18,16 +18,8 @@
   apoptosis, angiogenesis, invasion/metastasis, genomic instability, etc.
   These are the biological categories your genes will fall into.
 
-**Why this matters for your project:**
-You are not studying cancer biology per se. You need enough vocabulary to
-interpret your results — e.g. "genes in the angiogenesis hallmark attenuate
-under site adjustment" is a meaningful clinical finding only if you know what
-angiogenesis means.
 
-**What to read:**
 - Hanahan D. (2022). "Hallmarks of Cancer: New Dimensions." Cancer Discovery.
-  (The updated version — free on PubMed.)
-  Read the abstract and Figure 1 only. You need the vocabulary, not the details.
 
 ---
 
@@ -43,7 +35,7 @@ angiogenesis means.
 
 **What to read:**
 - Conesa et al. (2016). "A survey of best practices for RNA-seq data analysis."
-  Genome Biology. Read sections 1 and 2 only (overview + preprocessing).
+  Genome Biology.
 - The TCGA GDC documentation on RNA-seq data:
   https://docs.gdc.cancer.gov/Data/Bioinformatics_Pipelines/Expression_mRNA_Pipeline/
 
@@ -59,10 +51,9 @@ angiogenesis means.
 
 **What to read:**
 - Liu et al. (2018). "An integrated TCGA pan-cancer clinical data resource."
-  Cell. (You already know this one — skim the methods.)
+  Cell.
 - Howard et al. (2021). "The impact of site-specific digital histology
   signatures on deep learning model accuracy and bias." Nature Communications.
-  (The paper your project builds on — read fully.)
 
 ---
 
