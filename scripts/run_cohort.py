@@ -16,6 +16,7 @@ results/pan_cancer_summary.csv is a derived cross-cohort aggregate.
     python scripts/run_cohort.py --panels hallmark topvar:500 topvar:2000   # robustness
     python scripts/run_cohort.py --combat                        # ComBat sensitivity
     python scripts/run_cohort.py --loso                          # leave-one-site-out C-index (slow)
+    python scripts/run_cohort.py --loso --cv-folds 5             # balanced preserved-site 5-fold (faster)
     python scripts/run_cohort.py --no-traces                     # results.csv only (save disk)
     python scripts/run_cohort.py --force                         # recompute even if done
 
@@ -286,21 +287,125 @@ def c_index(times, events, scores):
     return num / den if den else np.nan
 
 
-def loso_cindex(df, gene_cols, time_col, event_col, p0, draws, chains, target_accept):
+def cv_cindex(df, gene_cols, time_col, event_col, p0, draws, chains, target_accept, folds):
+    """Pooled out-of-fold C-index for Model A (naive) and Model B (site-adjusted).
+
+    `folds` is a list of fold definitions, each a collection of TSS codes held out
+    together: LOSO = one site per fold; preserved-site k-fold = a balanced group of
+    sites per fold. Either way every test site is entirely unseen in training (no
+    site leakage), so predictions use only the genomic linear predictor — held-out
+    sites have no estimable site intercept."""
     dfl = _valid(df, time_col, event_col).reset_index(drop=True)
     Xall = dfl[gene_cols].values
     t = dfl[time_col].values
     e = dfl[event_col].values.astype(int)
     eta_a = np.full(len(dfl), np.nan)
     eta_b = np.full(len(dfl), np.nan)
-    for s in dfl["tss"].unique():
-        test = dfl["tss"].values == s
+    for fold_sites in folds:
+        test = dfl["tss"].isin(fold_sites).values
+        if not test.any():
+            continue
         train = dfl[~test]
         ta = sample(build_model_a(train, gene_cols, time_col, event_col, p0), draws, draws, chains, target_accept)
         tb = sample(build_model_b(train, gene_cols, time_col, event_col, p0), draws, draws, chains, target_accept)
         eta_a[test] = Xall[test] @ ta.posterior["beta"].mean(("chain", "draw")).values
         eta_b[test] = Xall[test] @ tb.posterior["beta"].mean(("chain", "draw")).values
     return c_index(t, e, eta_a), c_index(t, e, eta_b)
+
+
+# --- preserved-site cross-validation folds (Howard et al. 2021, Nat Commun) -----
+# Assign whole sites to k folds, balancing each class's count across folds. This is
+# Howard's stratification: minimise, per class, sum_fold (k * count_in_fold - total)^2,
+# subject to each site in exactly one fold. We balance the event indicator (0/1) so
+# events are spread evenly. Solved exactly as Howard's binary MIQP (cvxpy + a MIQP
+# solver) when one is installed, else by a greedy + local search on the SAME objective
+# (CPLEX, Howard's solver, is commercial; the fallback needs no extra dependency).
+def _howard_objective(assign, counts, k):
+    err = 0.0
+    for cnt in counts:                       # cnt: per-site count of one class
+        tot = cnt.sum()
+        for j in range(k):
+            err += (k * cnt[assign == j].sum() - tot) ** 2   # assign == -1 (unplaced) excluded
+    return float(err)
+
+
+def _folds_miqp(n, k, counts):
+    try:
+        import cvxpy as cp
+    except Exception:
+        return None
+    g = [cp.Variable(n, boolean=True) for _ in range(k)]
+    constraints = [sum(g) == np.ones(n)]     # each site in exactly one fold
+    error = 0
+    for cnt in counts:
+        tot = float(cnt.sum())
+        for j in range(k):
+            error += cp.square(k * (g[j] @ cnt) - tot)
+    prob = cp.Problem(cp.Minimize(error), constraints)
+    for solver in ("CPLEX", "GUROBI", "MOSEK", "SCIP"):
+        if solver in cp.installed_solvers():
+            try:
+                prob.solve(solver=solver)
+            except Exception:
+                continue
+            if g[0].value is not None:
+                return np.array([next(j for j in range(k) if g[j].value[i] > 0.5) for i in range(n)])
+    return None
+
+
+def _folds_greedy(n, k, counts, seed):
+    rng = np.random.default_rng(seed)
+    size = sum(counts)                        # total patients per site
+    order = sorted(range(n), key=lambda i: (-int(size[i]), int(rng.integers(1 << 30))))
+    assign = np.full(n, -1)
+    for i in order:                          # greedy: largest sites first, into the best fold
+        best_j, best_e = 0, None
+        for j in range(k):
+            assign[i] = j
+            e = _howard_objective(assign, counts, k)
+            if best_e is None or e < best_e:
+                best_e, best_j = e, j
+        assign[i] = best_j
+    improved = True                          # local search: relocate single sites until stable
+    while improved:
+        improved = False
+        cur = _howard_objective(assign, counts, k)
+        for i in range(n):
+            cj = assign[i]
+            for j in range(k):
+                if j == cj:
+                    continue
+                assign[i] = j
+                e = _howard_objective(assign, counts, k)
+                if e < cur - 1e-9:
+                    cur, cj, improved = e, j, True
+                else:
+                    assign[i] = cj
+    return assign
+
+
+def preserved_site_folds(df, event_col, k, seed=0):
+    sites = np.array(sorted(df["tss"].unique()))
+    n = len(sites)
+    if k >= n:
+        return [[s] for s in sites]          # k >= sites -> degenerates to LOSO
+    ev = df[event_col].astype(int).values
+    tss = df["tss"].values
+    counts = [np.array([int(((tss == s) & (ev == c)).sum()) for s in sites]) for c in (0, 1)]
+    assign = _folds_miqp(n, k, counts)
+    used = "MIQP"
+    if assign is None:
+        assign, used = _folds_greedy(n, k, counts, seed), "greedy"
+    per_fold_ev = [int(counts[1][assign == j].sum()) for j in range(k)]
+    log.info("preserved-site %d-fold (%s): %d sites, per-fold events=%s", k, used, n, per_fold_ev)
+    return [[s for s, a in zip(sites, assign) if a == j] for j in range(k)]
+
+
+def make_folds(df, event_col, cv_folds):
+    """LOSO (cv_folds < 2, one site per fold) or balanced preserved-site k-fold."""
+    if cv_folds and cv_folds >= 2:
+        return preserved_site_folds(df, event_col, cv_folds)
+    return [[s] for s in sorted(df["tss"].unique())]
 
 
 def combat_correct(df, gene_cols, batch_col="tss"):
@@ -345,7 +450,9 @@ def analyze(cohort, df, endpoint, panel, gene_cols, args, combat=False):
     }
     row.update(icc_decomposition(tb, Xb))
     if args.loso:
-        cA, cB = loso_cindex(df, gene_cols, tc, ec, args.p0, args.loso_draws, 2, args.target_accept)
+        folds = make_folds(dfv, ec, args.cv_folds)
+        row["cv_scheme"] = f"preserved{args.cv_folds}" if (args.cv_folds and args.cv_folds >= 2) else "loso"
+        cA, cB = cv_cindex(df, gene_cols, tc, ec, args.p0, args.loso_draws, 2, args.target_accept, folds)
         row["cindex_A"], row["cindex_B"], row["cindex_gap"] = cA, cB, cB - cA
     return row
 
@@ -437,7 +544,12 @@ def main():
     ap.add_argument("--tune", type=int, default=1000)
     ap.add_argument("--chains", type=int, default=4)
     ap.add_argument("--target-accept", type=float, default=0.99)
-    ap.add_argument("--loso", action="store_true", help="also run leave-one-site-out C-index (slow)")
+    ap.add_argument("--loso", action="store_true",
+                    help="also run a site-preserved CV C-index (slow); scheme set by --cv-folds")
+    ap.add_argument("--cv-folds", type=int, default=0,
+                    help="CV scheme for the --loso C-index: 0 = LOSO (default, one site per fold, "
+                         "n_sites refits); >=2 = balanced preserved-site k-fold (Howard et al. 2021), "
+                         "~n_sites/k times faster, same no-leakage guarantee")
     ap.add_argument("--loso-draws", type=int, default=500)
     ap.add_argument("--no-traces", action="store_true",
                     help="skip saving .nc traces (results.csv still written; saves disk)")

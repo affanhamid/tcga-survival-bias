@@ -25,5 +25,12 @@ h5netcdf==1.8.1          # netCDF trace IO
 gseapy==1.2.1            # MSigDB Hallmark gene sets
 inmoose==0.9.1           # pyComBat (ComBat sensitivity)
 
+# OPTIONAL — exact Howard preserved-site k-fold (--cv-folds). cvxpy formulates the
+# fold-assignment MIQP; it needs a MIQP-capable solver (SCIP via pyscipopt is the open
+# one). Without it run_cohort uses a built-in greedy + local-search fallback on the
+# identical objective, so this is not required.
+# cvxpy==1.7.4
+# pyscipopt==5.6.0
+
 # notebooks (optional on a headless server)
 ipykernel==7.3.0
