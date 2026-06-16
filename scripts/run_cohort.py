@@ -447,6 +447,10 @@ def main():
 
     logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+    # quiet third-party chatter (pytensor/nutpie JIT, matplotlib, etc.) — keep our own pipeline lines
+    for noisy in ("pytensor", "nutpie", "matplotlib", "arviz", "arviz_base", "arviz_stats",
+                  "arviz_plots", "gseapy", "numba"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     done = set() if args.force else done_combos()
     log.info("cohorts=%d endpoints=%s panels=%s p0=%d combat=%s loso=%s (%d combos already done)",
