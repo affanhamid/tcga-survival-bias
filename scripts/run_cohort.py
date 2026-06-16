@@ -25,7 +25,6 @@ results.csv files are skipped unless --force.
 from __future__ import annotations
 
 import argparse
-import glob
 import logging
 import sys
 import time
@@ -37,8 +36,8 @@ import pandas as pd
 # shared data-acquisition module, imported from this script's own directory
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import download
-from download import (PROJECT_ROOT, RAW_DIR, PROCESSED_DIR, CDR_PATH, COUNTS_GLOB,
-                      download_cohort)
+from download import (PROJECT_ROOT, RAW_DIR, PROCESSED_DIR, CDR_PATH,
+                      EXPR_LOG2_THRESHOLD)
 
 # ----------------------------------------------------------------------------
 # paths & config (data acquisition lives in download.py)
@@ -68,44 +67,62 @@ def cohort_dir(cohort: str) -> Path:
 
 
 # ----------------------------------------------------------------------------
-# cohort table (mirrors 01_data_prep): dedup -> gene matrix -> filter/transform
+# cohort table (mirrors 01_data_prep): xena matrix -> filter/transform -> labels
 # ----------------------------------------------------------------------------
+def _patient(bc: str) -> str:
+    return "-".join(bc.split("-")[:3])          # TCGA-60-2698-01A -> TCGA-60-2698
+
+
+def _tss(bc: str) -> str:
+    return bc.split("-")[1]                       # TCGA-60-2698-01A -> 60
+
+
+def _sample_type(bc: str) -> str:
+    parts = bc.split("-")
+    return parts[3][:2] if len(parts) >= 4 else ""  # TCGA-60-2698-01A -> 01
+
+
 def prepare_cohort(cohort: str) -> Path:
-    """Download + build data/processed/{cohort}/{cohort}.parquet. Returns the parquet path."""
+    """Download + build data/processed/{cohort}/{cohort}.parquet. Returns the parquet path.
+
+    Reads the Xena STAR FPKM-UQ matrix (log2(fpkm_uq+1)), keeps protein-coding
+    genes and primary-tumour samples (sample-type code '01' — matching the old
+    GDC 'Primary Tumor' filter; note this excludes LAML(03)/SKCM(06) as before),
+    dedups to one sample per patient, applies the expression filter + z-score,
+    then joins TCGA-CDR survival labels."""
     parquet = cohort_dir(cohort) / f"{cohort}.parquet"
     if parquet.exists():
         return parquet
 
-    barcodes = download_cohort(cohort)
-    assert (barcodes["sample_type"] == "Primary Tumor").all()
-    assert (barcodes["project_id"] == f"TCGA-{cohort}").all()
+    download.download_cdr()
+    gz = download.download_xena_matrix(cohort)
+    annot = download.gene_annotation()
+    pc = set(annot.loc[annot["gene_type"] == "protein_coding", "gene_id"])
 
-    dedup = (barcodes.sort_values("aliquot_barcode")
-             .groupby("patient_barcode", as_index=False).first())
-    log.info("[%s] %d files -> %d patients (deduped)", cohort, len(barcodes), len(dedup))
+    mat = pd.read_csv(gz, sep="\t", index_col=0)            # genes x samples, log2(fpkm_uq+1)
+    mat = mat[mat.index.isin(pc)]                           # protein-coding genes only
 
-    cols = {}
-    for fid in dedup["file_id"]:
-        tsv = next((RAW_DIR / cohort / fid).glob(COUNTS_GLOB))
-        g = pd.read_csv(tsv, sep="\t", skiprows=1)
-        g = g[g["gene_id"].str.startswith("ENSG")]
-        g = g[g["gene_type"] == "protein_coding"]
-        cols[fid] = g.set_index("gene_id")["fpkm_uq_unstranded"]
-    gene_matrix = pd.DataFrame(cols)
-    gene_matrix.to_csv(RAW_DIR / cohort / "gene_matrix.csv")
+    prim = [c for c in mat.columns if _sample_type(c) == "01"]  # primary solid tumour
+    mat = mat[prim]
+    seen, keep = set(), []                                  # dedup: one sample per patient
+    for c in sorted(mat.columns):
+        p = _patient(c)
+        if p not in seen:
+            seen.add(p)
+            keep.append(c)
+    mat = mat[keep]
+    log.info("[%s] %d primary-tumour samples -> %d patients (deduped)", cohort, len(prim), len(keep))
 
-    n = gene_matrix.shape[1]
-    keep = (gene_matrix >= 1).sum(axis=1) >= 0.1 * n
-    gene_matrix = gene_matrix.loc[keep]
-    logm = np.log2(gene_matrix + 1)
-    zscore = logm.sub(logm.mean(axis=1), axis=0).div(logm.std(axis=1), axis=0)
+    n = mat.shape[1]                                        # expression filter (>=1 in >=10%)
+    mat = mat.loc[(mat >= EXPR_LOG2_THRESHOLD).sum(axis=1) >= 0.1 * n]
+    zscore = mat.sub(mat.mean(axis=1), axis=0).div(mat.std(axis=1), axis=0)
     assert not zscore.isna().any().any(), "NaNs in zscore (zero-variance gene)"
     log.info("[%s] genes after expression filter: %d", cohort, zscore.shape[0])
 
     X = zscore.T
-    X.index.name = "file_id"
-    meta = dedup.set_index("file_id")[["patient_barcode", "tss"]]
-    X = meta.join(X)
+    X.insert(0, "tss", [_tss(c) for c in X.index])
+    X.insert(0, "patient_barcode", [_patient(c) for c in X.index])
+    X = X.reset_index(drop=True)
 
     cdr = pd.read_excel(CDR_PATH, sheet_name="TCGA-CDR")
     cdr = cdr[cdr["type"] == cohort].copy()
@@ -145,10 +162,8 @@ def select_genes(cohort: str, df: pd.DataFrame, panel: str) -> list[str]:
     """panel = 'hallmark' or 'topvar:N'."""
     ensg = [c for c in df.columns if c.startswith("ENSG")]
     if panel == "hallmark":
-        tsv = glob.glob(str(RAW_DIR / cohort / "*" / COUNTS_GLOB))[0]
-        ref = pd.read_csv(tsv, sep="\t", skiprows=1)
-        ref = ref[ref["gene_id"].str.startswith("ENSG")]
-        sym2ens = dict(zip(ref["gene_name"], ref["gene_id"]))
+        annot = download.gene_annotation()
+        sym2ens = dict(zip(annot["gene_name"], annot["gene_id"]))
         hm = {sym2ens[s] for s in hallmark_symbols() if s in sym2ens}
         return [c for c in ensg if c in hm]
     if panel.startswith("topvar:"):

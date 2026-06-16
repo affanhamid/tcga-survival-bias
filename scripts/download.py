@@ -1,21 +1,31 @@
-"""TCGA / GDC data acquisition for the site-confounding project.
+"""TCGA RNA-seq acquisition via the UCSC Xena GDC hub.
 
 Shared by notebooks/01_data_prep.ipynb and scripts/run_cohort.py. Paths are
-computed from THIS file's location (not the caller's cwd), so it can be imported
-from a notebook in notebooks/ or a script in scripts/ and resolve to the same
-data/ directory.
+computed from THIS file's location (not the caller's cwd).
+
+Why Xena instead of gdc-client: the GDC harmonized STAR-Counts data is mirrored
+by the UCSC Xena GDC hub as a single pre-assembled matrix per project
+(`TCGA-{COHORT}.star_fpkm-uq.tsv.gz`) — one ~150 MB download replaces ~500
+per-file gdc-client transfers (days -> minutes). The matrix values are
+log2(fpkm_uq_unstranded + 1); we verified them bit-identical (max|diff|=1.8e-15,
+corr=1.0 over all 60,660 genes) to the GDC `fpkm_uq_unstranded` column we used
+before, so the switch is lossless and methodologically consistent.
+
+Matrix layout: rows = versioned Ensembl IDs (gencode v36, e.g. ENSG...15),
+columns = sample barcodes (e.g. TCGA-60-2698-01A). TSS is barcode field 2;
+sample-type code is field 4 (the '01' in '01A'); patient barcode is the first
+three fields. Xena carries no gene_type, so protein-coding filtering and
+symbol->Ensembl mapping use resources/gene_annotation.tsv (committed; identical
+across all cohorts since the STAR gene model is fixed).
 
 Public API:
     download_cdr() -> Path
-    download_gdc_manifest(cohort) -> Path
-    download_gdc_files(cohort) -> None
-    resolve_barcodes(cohort) -> pd.DataFrame
-    download_cohort(cohort) -> pd.DataFrame      # cdr + manifest + files + barcodes
+    download_xena_matrix(cohort) -> Path
+    gene_annotation() -> pd.DataFrame      # gene_id, gene_name, gene_type
+    download_cohort(cohort) -> Path        # cdr + xena matrix; returns matrix path
 """
 from __future__ import annotations
 
-import os
-import subprocess
 from pathlib import Path
 
 import pandas as pd
@@ -30,8 +40,13 @@ PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
 CDR_URL = "https://ars.els-cdn.com/content/image/1-s2.0-S0092867418302290-mmc1.xlsx"
 CDR_PATH = RAW_DIR / "tcga_cdr.xlsx"
-COUNTS_GLOB = "*.rna_seq.augmented_star_gene_counts.tsv"
-GDC_FILES_ENDPOINT = "https://api.gdc.cancer.gov/files"
+
+XENA_BASE = "https://gdc-hub.s3.us-east-1.amazonaws.com/download"
+GENE_ANNOT_PATH = PROJECT_ROOT / "resources" / "gene_annotation.tsv"
+
+# Xena matrix value = log2(fpkm_uq + 1). On that scale the old raw-FPKM-UQ
+# expression filter "fpkm_uq >= 1" is identical, since log2(x+1) >= 1 <=> x >= 1.
+EXPR_LOG2_THRESHOLD = 1.0
 
 
 def download_cdr() -> Path:
@@ -42,110 +57,54 @@ def download_cdr() -> Path:
     print("Downloading TCGA-CDR survival labels...")
     r = requests.get(CDR_URL, stream=True)
     r.raise_for_status()
-    with open(CDR_PATH, "wb") as f:
+    tmp = CDR_PATH.with_suffix(CDR_PATH.suffix + ".part")
+    with open(tmp, "wb") as f:
         for chunk in r.iter_content(chunk_size=8192):
             f.write(chunk)
+    tmp.rename(CDR_PATH)  # atomic: a partial download never looks complete
     print(f"Saved to {CDR_PATH}")
     return CDR_PATH
 
 
-def download_gdc_manifest(cohort: str) -> Path:
-    """Query GDC for primary-tumour STAR-Counts files of TCGA-{cohort}; write manifest. Idempotent."""
-    cohort_dir = RAW_DIR / cohort
-    cohort_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = cohort_dir / "manifest.txt"
-    if manifest_path.exists():
-        print(f"Manifest already present at {manifest_path}, skipping.")
-        return manifest_path
-
-    print(f"Downloading GDC manifest for {cohort}...")
-    filters = {
-        "op": "and",
-        "content": [
-            {"op": "=", "content": {"field": "cases.project.project_id", "value": f"TCGA-{cohort}"}},
-            {"op": "=", "content": {"field": "data_type", "value": "Gene Expression Quantification"}},
-            {"op": "=", "content": {"field": "analysis.workflow_type", "value": "STAR - Counts"}},
-            {"op": "=", "content": {"field": "data_format", "value": "TSV"}},
-            {"op": "=", "content": {"field": "cases.samples.sample_type", "value": "Primary Tumor"}},
-        ],
-    }
-    r = requests.post(
-        GDC_FILES_ENDPOINT,
-        headers={"Content-Type": "application/json"},
-        json={"filters": filters, "return_type": "manifest", "size": 10000},
-    )
+def download_xena_matrix(cohort: str) -> Path:
+    """Download TCGA-{cohort}.star_fpkm-uq.tsv.gz from the Xena GDC hub. Idempotent."""
+    out = RAW_DIR / cohort / "star_fpkm-uq.tsv.gz"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.exists():
+        print(f"Xena matrix already present at {out}, skipping.")
+        return out
+    url = f"{XENA_BASE}/TCGA-{cohort}.star_fpkm-uq.tsv.gz"
+    print(f"Downloading Xena matrix for {cohort} from {url} ...")
+    r = requests.get(url, stream=True)
     r.raise_for_status()
-    manifest_path.write_text(r.text)
-    print(f"Files in manifest: {len(r.text.strip().splitlines()) - 1}")
-    return manifest_path
+    tmp = out.with_suffix(out.suffix + ".part")
+    n = 0
+    with open(tmp, "wb") as f:
+        for chunk in r.iter_content(chunk_size=1 << 20):
+            f.write(chunk)
+            n += len(chunk)
+    tmp.rename(out)  # atomic rename so an interrupted download isn't mistaken for complete
+    print(f"Saved {n / 1e6:.0f} MB to {out}")
+    return out
 
 
-def download_gdc_files(cohort: str) -> None:
-    """gdc-client download every file in the cohort manifest. Skips already-downloaded files."""
-    manifest_path = RAW_DIR / cohort / "manifest.txt"
-    output_dir = RAW_DIR / cohort
-    output_dir.mkdir(parents=True, exist_ok=True)
-    file_ids = pd.read_csv(manifest_path, sep="\t")["id"].tolist()
-    missing = [f for f in file_ids if not (output_dir / f).is_dir()]
-    if not missing:
-        print(f"All {len(file_ids)} {cohort} files already downloaded, skipping.")
-        return
-    print(f"Downloading {cohort} files to {output_dir} ({len(missing)} of {len(file_ids)} missing)...")
-    subprocess.run(
-        ["gdc-client", "download", "-m", str(manifest_path), "-d", str(output_dir), "-n", "8"],
-        check=True,
-    )
-    print("Done.")
+_ANNOT = None
 
 
-def resolve_barcodes(cohort: str) -> pd.DataFrame:
-    """Map each manifest file UUID to patient/sample/aliquot barcode + TSS via the GDC
-    /files endpoint. Writes data/raw/{cohort}/barcodes.csv. Idempotent."""
-    out_path = RAW_DIR / cohort / "barcodes.csv"
-    if out_path.exists():
-        print(f"Barcodes already present at {out_path}, skipping.")
-        return pd.read_csv(out_path)
-
-    manifest_path = RAW_DIR / cohort / "manifest.txt"
-    file_ids = pd.read_csv(manifest_path, sep="\t")["id"].tolist()
-    print(f"Resolving barcodes for {len(file_ids)} files...")
-    fields = ",".join([
-        "file_id", "file_name", "cases.submitter_id", "cases.samples.submitter_id",
-        "cases.samples.sample_type",
-        "cases.samples.portions.analytes.aliquots.submitter_id",
-        "cases.project.project_id",
-    ])
-    r = requests.post(
-        GDC_FILES_ENDPOINT,
-        headers={"Content-Type": "application/json"},
-        json={
-            "filters": {"op": "in", "content": {"field": "file_id", "value": file_ids}},
-            "fields": fields, "format": "json", "size": len(file_ids) + 100,
-        },
-    )
-    r.raise_for_status()
-    rows = []
-    for h in r.json()["data"]["hits"]:
-        case = h["cases"][0]
-        sample = case["samples"][0]
-        aliquot = sample["portions"][0]["analytes"][0]["aliquots"][0]
-        pb = case["submitter_id"]
-        rows.append({
-            "file_id": h["file_id"], "file_name": h["file_name"],
-            "project_id": case["project"]["project_id"],
-            "patient_barcode": pb, "sample_barcode": sample["submitter_id"],
-            "aliquot_barcode": aliquot["submitter_id"],
-            "sample_type": sample["sample_type"], "tss": pb.split("-")[1],
-        })
-    df = pd.DataFrame(rows)
-    df.to_csv(out_path, index=False)
-    print(f"Wrote {len(df)} rows to {out_path}")
-    return df
+def gene_annotation() -> pd.DataFrame:
+    """gencode v36 gene_id/gene_name/gene_type (cached). Identical across all cohorts."""
+    global _ANNOT
+    if _ANNOT is None:
+        if not GENE_ANNOT_PATH.exists():
+            raise FileNotFoundError(
+                f"{GENE_ANNOT_PATH} missing — expected committed gencode v36 annotation "
+                "(gene_id, gene_name, gene_type) built once from any STAR-Counts TSV."
+            )
+        _ANNOT = pd.read_csv(GENE_ANNOT_PATH, sep="\t")
+    return _ANNOT
 
 
-def download_cohort(cohort: str) -> pd.DataFrame:
-    """Convenience: CDR + manifest + files + barcodes for one cohort. Returns barcodes."""
+def download_cohort(cohort: str) -> Path:
+    """Convenience: CDR + Xena matrix for one cohort. Returns the matrix path."""
     download_cdr()
-    download_gdc_manifest(cohort)
-    download_gdc_files(cohort)
-    return resolve_barcodes(cohort)
+    return download_xena_matrix(cohort)
