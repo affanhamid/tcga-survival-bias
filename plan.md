@@ -327,8 +327,12 @@ All TCGA cancer types with ≥ 50 death events in the OS endpoint.
 Expected: ~18-22 cancer types, ~7,000-9,000 patients total.
 
 **Survival labels:**
-TCGA-CDR Table S1 (Liu et al. 2018). Endpoint: OS (overall survival).
-`time` = OS.time (days). `event` = OS (1=dead, 0=censored).
+TCGA-CDR Table S1 (Liu et al. 2018). **Primary endpoint: PFI** (progression-free
+interval) — Liu et al. recommend PFI for most cancer types (more events, less
+confounded by non-cancer death and treatment). `time` = PFI.time, `event` = PFI.
+**Secondary: OS** (overall survival), `time` = OS.time, `event` = OS. Follow Liu
+et al.'s per-cancer-type endpoint recommendation table where it differs. All
+endpoints (OS/DSS/PFI/DFI) are stored in the cohort parquet so any can be run.
 
 **Genomic features:**
 RNA-seq FPKM-UQ data from TCGA GDC portal.
@@ -545,6 +549,13 @@ tcga-site-genomics-survival/
       (primary); patient-level LOO-CV/ELPD as a secondary in-sample check
 - [ ] Kaplan-Meier validation on the leave-one-site-out risk predictions:
       do the high/low risk groups from Model B separate better than Model A?
+- [ ] **Robustness — top-variance panel:** rerun Model A/B on the top-N
+      (500 and 2000) by-variance genes (data-driven, no outcome selection). If
+      the gene null persists, it is not an artifact of the hallmark restriction.
+- [ ] **Sensitivity — ComBat:** ComBat-correct expression by TSS, refit, and
+      show (a) ICC_site collapses to ~0 by construction, (b) LOSO C-index does
+      not improve, (c) site-correlated biological signal is removed too — i.e.
+      ComBat cannot decompose site vs. biology the way the random-effect model can.
 - **Deliverable:** All paper figures
 
 #### Stage 4 — Paper (1-2 weeks)

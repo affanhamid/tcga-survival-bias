@@ -2,28 +2,31 @@
 """
 Pan-cancer site-confounding pipeline (RQ1/RQ2/RQ3).
 
-For each TCGA cohort: download -> build cohort parquet -> hallmark panel ->
-fit Model A (naive) and Model B (site-adjusted) with nutpie -> ICC variance
-decomposition -> gene hits -> optional leave-one-site-out C-index. Saves
-per-cohort traces and appends a row to results/pan_cancer_summary.csv.
+Per TCGA cohort: download (via scripts/download.py) -> build cohort parquet ->
+for each (endpoint, gene panel): fit Model A (naive) and Model B (site-adjusted)
+with nutpie -> ICC variance decomposition -> gene hits -> optional
+leave-one-site-out C-index, plus an optional ComBat sensitivity analysis.
 
-Designed to run unattended on a server (e.g. in tmux):
+Everything for a cohort is written under data/processed/{cohort}/ (parquet,
+traces/, results.csv) so that directory alone is enough to resume/continue;
+results/pan_cancer_summary.csv is a derived cross-cohort aggregate.
 
-    python scripts/run_cohort.py                       # all viable cohorts, ICC only
-    python scripts/run_cohort.py --cohorts LUSC HNSC   # a subset
-    python scripts/run_cohort.py --loso                # also run LOSO C-index (slow)
-    python scripts/run_cohort.py --force               # recompute even if done
+    python scripts/run_cohort.py                                 # PFI+OS, hallmark, ICC only
+    python scripts/run_cohort.py --cohorts LUSC HNSC
+    python scripts/run_cohort.py --panels hallmark topvar:500 topvar:2000   # robustness
+    python scripts/run_cohort.py --combat                        # ComBat sensitivity
+    python scripts/run_cohort.py --loso                          # leave-one-site-out C-index (slow)
+    python scripts/run_cohort.py --no-traces                     # results.csv only (save disk)
+    python scripts/run_cohort.py --force                         # recompute even if done
 
-Re-runs are resumable: cohorts already marked "ok" in the summary CSV are
-skipped unless --force.
+Resumable: (cohort, endpoint, panel) combos already "ok" in the per-cohort
+results.csv files are skipped unless --force.
 """
 from __future__ import annotations
 
 import argparse
 import glob
 import logging
-import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -31,160 +34,56 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+# shared data-acquisition module, imported from this script's own directory
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import download
+from download import (PROJECT_ROOT, RAW_DIR, PROCESSED_DIR, CDR_PATH, COUNTS_GLOB,
+                      download_cohort)
+
 # ----------------------------------------------------------------------------
-# paths & config
+# paths & config (data acquisition lives in download.py)
 # ----------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
-RAW_DIR = DATA_DIR / "raw"
-PROCESSED_DIR = DATA_DIR / "processed"
 RESULTS_DIR = PROJECT_ROOT / "results"
-TRACE_DIR = RESULTS_DIR / "traces"
-SUMMARY_CSV = RESULTS_DIR / "pan_cancer_summary.csv"
+SUMMARY_CSV = RESULTS_DIR / "pan_cancer_summary.csv"   # cross-cohort aggregate (derived)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-for d in (RAW_DIR, PROCESSED_DIR, TRACE_DIR):
-    d.mkdir(parents=True, exist_ok=True)
-
-CDR_URL = "https://ars.els-cdn.com/content/image/1-s2.0-S0092867418302290-mmc1.xlsx"
-CDR_PATH = RAW_DIR / "tcga_cdr.xlsx"
-COUNTS_GLOB = "*.rna_seq.augmented_star_gene_counts.tsv"
-
-# all 33 TCGA project codes; non-viable ones (too few deaths / no data) are skipped
 ALL_TCGA = [
     "ACC", "BLCA", "BRCA", "CESC", "CHOL", "COAD", "DLBC", "ESCA", "GBM",
     "HNSC", "KICH", "KIRC", "KIRP", "LAML", "LGG", "LIHC", "LUAD", "LUSC",
     "MESO", "OV", "PAAD", "PCPG", "PRAD", "READ", "SARC", "SKCM", "STAD",
     "TGCT", "THCA", "THYM", "UCEC", "UCS", "UVM",
 ]
-
-ENDPOINTS = ["OS", "OS_time", "DSS", "DSS_time", "PFI", "PFI_time", "DFI", "DFI_time"]
+ENDPOINTS_ALL = ["OS", "OS_time", "DSS", "DSS_time", "PFI", "PFI_time", "DFI", "DFI_time"]
+KEY = ["cohort", "endpoint", "panel"]
 
 log = logging.getLogger("run_cohort")
 
 
-# ----------------------------------------------------------------------------
-# data acquisition (mirrors notebooks/01_data_prep.ipynb)
-# ----------------------------------------------------------------------------
-def download_cdr() -> Path:
-    if CDR_PATH.exists():
-        return CDR_PATH
-    import requests
-    log.info("downloading TCGA-CDR survival labels")
-    r = requests.get(CDR_URL, stream=True)
-    r.raise_for_status()
-    with open(CDR_PATH, "wb") as f:
-        for chunk in r.iter_content(chunk_size=8192):
-            f.write(chunk)
-    return CDR_PATH
-
-
-def download_manifest(cohort: str) -> Path:
-    import requests
-    cohort_dir = RAW_DIR / cohort
-    cohort_dir.mkdir(parents=True, exist_ok=True)
-    manifest = cohort_dir / "manifest.txt"
-    if manifest.exists():
-        return manifest
-    log.info("[%s] downloading GDC manifest", cohort)
-    filters = {
-        "op": "and",
-        "content": [
-            {"op": "=", "content": {"field": "cases.project.project_id", "value": f"TCGA-{cohort}"}},
-            {"op": "=", "content": {"field": "data_type", "value": "Gene Expression Quantification"}},
-            {"op": "=", "content": {"field": "analysis.workflow_type", "value": "STAR - Counts"}},
-            {"op": "=", "content": {"field": "data_format", "value": "TSV"}},
-            {"op": "=", "content": {"field": "cases.samples.sample_type", "value": "Primary Tumor"}},
-        ],
-    }
-    r = requests.post(
-        "https://api.gdc.cancer.gov/files",
-        headers={"Content-Type": "application/json"},
-        json={"filters": filters, "return_type": "manifest", "size": 10000},
-    )
-    r.raise_for_status()
-    manifest.write_text(r.text)
-    n = len(r.text.strip().split("\n")) - 1
-    log.info("[%s] manifest: %d files", cohort, n)
-    return manifest
-
-
-def download_files(cohort: str) -> None:
-    manifest = RAW_DIR / cohort / "manifest.txt"
-    out_dir = RAW_DIR / cohort
-    file_ids = pd.read_csv(manifest, sep="\t")["id"].tolist()
-    missing = [f for f in file_ids if not (out_dir / f).is_dir()]
-    if not missing:
-        log.info("[%s] all %d files already downloaded", cohort, len(file_ids))
-        return
-    log.info("[%s] downloading %d/%d missing files", cohort, len(missing), len(file_ids))
-    subprocess.run(
-        ["gdc-client", "download", "-m", str(manifest), "-d", str(out_dir), "-n", "8"],
-        check=True,
-    )
-
-
-def resolve_barcodes(cohort: str) -> pd.DataFrame:
-    import requests
-    out_path = RAW_DIR / cohort / "barcodes.csv"
-    if out_path.exists():
-        return pd.read_csv(out_path)
-    manifest = RAW_DIR / cohort / "manifest.txt"
-    file_ids = pd.read_csv(manifest, sep="\t")["id"].tolist()
-    fields = ",".join([
-        "file_id", "file_name", "cases.submitter_id", "cases.samples.submitter_id",
-        "cases.samples.sample_type",
-        "cases.samples.portions.analytes.aliquots.submitter_id",
-        "cases.project.project_id",
-    ])
-    r = requests.post(
-        "https://api.gdc.cancer.gov/files",
-        headers={"Content-Type": "application/json"},
-        json={
-            "filters": {"op": "in", "content": {"field": "file_id", "value": file_ids}},
-            "fields": fields, "format": "json", "size": len(file_ids) + 100,
-        },
-    )
-    r.raise_for_status()
-    rows = []
-    for h in r.json()["data"]["hits"]:
-        case = h["cases"][0]
-        sample = case["samples"][0]
-        aliquot = sample["portions"][0]["analytes"][0]["aliquots"][0]
-        pb = case["submitter_id"]
-        rows.append({
-            "file_id": h["file_id"], "file_name": h["file_name"],
-            "project_id": case["project"]["project_id"],
-            "patient_barcode": pb, "sample_barcode": sample["submitter_id"],
-            "aliquot_barcode": aliquot["submitter_id"],
-            "sample_type": sample["sample_type"], "tss": pb.split("-")[1],
-        })
-    df = pd.DataFrame(rows)
-    df.to_csv(out_path, index=False)
-    return df
+def cohort_dir(cohort: str) -> Path:
+    """Per-cohort output dir: data/processed/{cohort}/ (with a traces/ subdir).
+    Holds the cohort parquet, model traces, and that cohort's results.csv."""
+    d = PROCESSED_DIR / cohort
+    (d / "traces").mkdir(parents=True, exist_ok=True)
+    return d
 
 
 # ----------------------------------------------------------------------------
 # cohort table (mirrors 01_data_prep): dedup -> gene matrix -> filter/transform
 # ----------------------------------------------------------------------------
 def prepare_cohort(cohort: str) -> Path:
-    """Download + build data/processed/{cohort}.parquet. Returns the parquet path."""
-    parquet = PROCESSED_DIR / f"{cohort}.parquet"
+    """Download + build data/processed/{cohort}/{cohort}.parquet. Returns the parquet path."""
+    parquet = cohort_dir(cohort) / f"{cohort}.parquet"
     if parquet.exists():
         return parquet
 
-    download_cdr()
-    download_manifest(cohort)
-    download_files(cohort)
-    barcodes = resolve_barcodes(cohort)
+    barcodes = download_cohort(cohort)
     assert (barcodes["sample_type"] == "Primary Tumor").all()
     assert (barcodes["project_id"] == f"TCGA-{cohort}").all()
 
-    # dedup aliquots -> one row per patient (alphabetically first aliquot)
     dedup = (barcodes.sort_values("aliquot_barcode")
              .groupby("patient_barcode", as_index=False).first())
     log.info("[%s] %d files -> %d patients (deduped)", cohort, len(barcodes), len(dedup))
 
-    # gene matrix: protein-coding FPKM-UQ, genes x file_id (collect once, concat once)
     cols = {}
     for fid in dedup["file_id"]:
         tsv = next((RAW_DIR / cohort / fid).glob(COUNTS_GLOB))
@@ -195,7 +94,6 @@ def prepare_cohort(cohort: str) -> Path:
     gene_matrix = pd.DataFrame(cols)
     gene_matrix.to_csv(RAW_DIR / cohort / "gene_matrix.csv")
 
-    # expression filter -> log2 -> per-gene standardise
     n = gene_matrix.shape[1]
     keep = (gene_matrix >= 1).sum(axis=1) >= 0.1 * n
     gene_matrix = gene_matrix.loc[keep]
@@ -204,7 +102,6 @@ def prepare_cohort(cohort: str) -> Path:
     assert not zscore.isna().any().any(), "NaNs in zscore (zero-variance gene)"
     log.info("[%s] genes after expression filter: %d", cohort, zscore.shape[0])
 
-    # transpose, attach ids, join ALL survival endpoints (NaNs kept by design)
     X = zscore.T
     X.index.name = "file_id"
     meta = dedup.set_index("file_id")[["patient_barcode", "tss"]]
@@ -221,55 +118,59 @@ def prepare_cohort(cohort: str) -> Path:
 
     id_cols = ["patient_barcode", "tss"]
     gene_cols = [c for c in final.columns if c.startswith("ENSG")]
-    final = final[id_cols + ENDPOINTS + gene_cols]
+    final = final[id_cols + ENDPOINTS_ALL + gene_cols]
     assert final["patient_barcode"].is_unique
     assert not final[id_cols + gene_cols].isna().any().any()
     final.to_parquet(parquet, index=False)
-    log.info("[%s] wrote %s  shape=%s", cohort, parquet.name, final.shape)
+    log.info("[%s] wrote %s shape=%s", cohort, parquet, final.shape)
     return parquet
 
 
 # ----------------------------------------------------------------------------
-# hallmark gene panel
+# gene panels
 # ----------------------------------------------------------------------------
-_HALLMARK_SYMBOLS = None
+_HALLMARK = None
 
 
 def hallmark_symbols() -> set:
-    global _HALLMARK_SYMBOLS
-    if _HALLMARK_SYMBOLS is None:
+    global _HALLMARK
+    if _HALLMARK is None:
         import gseapy as gp
         hm = gp.get_library(name="MSigDB_Hallmark_2020", organism="Human")
-        _HALLMARK_SYMBOLS = {g for genes in hm.values() for g in genes}
-    return _HALLMARK_SYMBOLS
+        _HALLMARK = {g for genes in hm.values() for g in genes}
+    return _HALLMARK
 
 
-def hallmark_gene_cols(cohort: str, df: pd.DataFrame) -> list[str]:
-    """Map hallmark symbols -> versioned ENSG (via this cohort's STAR annotation),
-    intersect with the matrix columns present in df."""
-    tsv = glob.glob(str(RAW_DIR / cohort / "*" / COUNTS_GLOB))[0]
-    ref = pd.read_csv(tsv, sep="\t", skiprows=1)
-    ref = ref[ref["gene_id"].str.startswith("ENSG")]
-    sym2ens = dict(zip(ref["gene_name"], ref["gene_id"]))
-    hm_ens = {sym2ens[s] for s in hallmark_symbols() if s in sym2ens}
-    return [c for c in df.columns if c.startswith("ENSG") and c in hm_ens]
+def select_genes(cohort: str, df: pd.DataFrame, panel: str) -> list[str]:
+    """panel = 'hallmark' or 'topvar:N'."""
+    ensg = [c for c in df.columns if c.startswith("ENSG")]
+    if panel == "hallmark":
+        tsv = glob.glob(str(RAW_DIR / cohort / "*" / COUNTS_GLOB))[0]
+        ref = pd.read_csv(tsv, sep="\t", skiprows=1)
+        ref = ref[ref["gene_id"].str.startswith("ENSG")]
+        sym2ens = dict(zip(ref["gene_name"], ref["gene_id"]))
+        hm = {sym2ens[s] for s in hallmark_symbols() if s in sym2ens}
+        return [c for c in ensg if c in hm]
+    if panel.startswith("topvar:"):
+        n = int(panel.split(":")[1])
+        return df[ensg].var().nlargest(n).index.tolist()
+    raise ValueError(f"unknown panel: {panel}")
 
 
 # ----------------------------------------------------------------------------
-# models (identical structure to notebooks/03_Modelling.ipynb)
+# models (endpoint-parametrized; identical structure to notebooks/03_Modelling)
 # ----------------------------------------------------------------------------
-def _valid(df: pd.DataFrame) -> pd.DataFrame:
-    """OS endpoint requires t > 0 and non-missing event/time."""
-    return df[(df["OS_time"] > 0) & df["OS"].notna() & df["OS_time"].notna()]
+def _valid(df: pd.DataFrame, time_col: str, event_col: str) -> pd.DataFrame:
+    return df[(df[time_col] > 0) & df[event_col].notna() & df[time_col].notna()]
 
 
-def build_model_a(df, gene_cols, p0=10, slab_scale=2.0, slab_df=4.0):
+def build_model_a(df, gene_cols, time_col, event_col, p0=10, slab_scale=2.0, slab_df=4.0):
     import pymc as pm
     import pytensor.tensor as pt
-    df = _valid(df)
+    df = _valid(df, time_col, event_col)
     X = df[gene_cols].values
-    t = df["OS_time"].values
-    d = df["OS"].values.astype(int)
+    t = df[time_col].values
+    d = df[event_col].values.astype(int)
     n, p = X.shape
     obs, cens = d == 1, d == 0
     Xo, Xc, to, tc = X[obs], X[cens], t[obs], t[cens]
@@ -290,13 +191,13 @@ def build_model_a(df, gene_cols, p0=10, slab_scale=2.0, slab_df=4.0):
     return model
 
 
-def build_model_b(df, gene_cols, p0=10, slab_scale=2.0, slab_df=4.0):
+def build_model_b(df, gene_cols, time_col, event_col, p0=10, slab_scale=2.0, slab_df=4.0):
     import pymc as pm
     import pytensor.tensor as pt
-    df = _valid(df)
+    df = _valid(df, time_col, event_col)
     X = df[gene_cols].values
-    t = df["OS_time"].values
-    d = df["OS"].values.astype(int)
+    t = df[time_col].values
+    d = df[event_col].values.astype(int)
     site = pd.Categorical(df["tss"]).codes
     n_sites = int(site.max() + 1)
     n, p = X.shape
@@ -334,40 +235,34 @@ def sample(model, draws, tune, chains, target_accept):
 # ----------------------------------------------------------------------------
 # analysis helpers
 # ----------------------------------------------------------------------------
-def beta_samples(trace):
-    return trace.posterior["beta"].stack(s=("chain", "draw")).values  # (p, S)
+def _stack(trace, name):
+    return trace.posterior[name].stack(s=("chain", "draw")).values
 
 
 def gene_hits(trace, eti=89.0):
-    """# of genes whose ETI excludes 0 (numpy quantiles; avoids arviz dtype issues)."""
-    b = beta_samples(trace)
+    b = _stack(trace, "beta")
     a = (100 - eti) / 2
-    lo = np.percentile(b, a, axis=1)
-    hi = np.percentile(b, 100 - a, axis=1)
-    return int(((lo > 0) | (hi < 0)).sum())
+    return int(((np.percentile(b, a, axis=1) > 0) | (np.percentile(b, 100 - a, axis=1) < 0)).sum())
 
 
 def icc_decomposition(trace_b, Xb, eti=89.0):
-    post = trace_b.posterior
-    b = beta_samples(trace_b)
-    alpha = post["alpha"].stack(s=("chain", "draw")).values
-    sig = post["sigma_site"].stack(s=("chain", "draw")).values
+    b = _stack(trace_b, "beta")
+    alpha = _stack(trace_b, "alpha")
+    sig = _stack(trace_b, "sigma_site")
     var_g = (Xb @ b).var(axis=0)
     var_s = sig**2
     var_r = np.pi**2 / (6 * alpha**2)
     tot = var_s + var_g + var_r
     a = (100 - eti) / 2
-    out = {}
+    out = {"sigma_site_mean": float(sig.mean())}
     for name, x in (("site", var_s / tot), ("genomic", var_g / tot), ("residual", var_r / tot)):
         out[f"ICC_{name}_mean"] = float(x.mean())
         out[f"ICC_{name}_lo"] = float(np.percentile(x, a))
         out[f"ICC_{name}_hi"] = float(np.percentile(x, 100 - a))
-    out["sigma_site_mean"] = float(sig.mean())
     return out
 
 
 def c_index(times, events, scores):
-    """Harrell's C: higher score = predicted longer survival."""
     num = den = 0.0
     for i in np.where(events == 1)[0]:
         later = times > times[i]
@@ -376,124 +271,176 @@ def c_index(times, events, scores):
     return num / den if den else np.nan
 
 
-def loso_cindex(df, gene_cols, p0, draws, tune, chains, target_accept):
-    """Leave-one-site-out pooled C-index for Model A and Model B (genomic eta only)."""
-    dfl = _valid(df).reset_index(drop=True)
+def loso_cindex(df, gene_cols, time_col, event_col, p0, draws, chains, target_accept):
+    dfl = _valid(df, time_col, event_col).reset_index(drop=True)
     Xall = dfl[gene_cols].values
-    t = dfl["OS_time"].values
-    e = dfl["OS"].values.astype(int)
-    sites = dfl["tss"].unique()
+    t = dfl[time_col].values
+    e = dfl[event_col].values.astype(int)
     eta_a = np.full(len(dfl), np.nan)
     eta_b = np.full(len(dfl), np.nan)
-    for k, s in enumerate(sites, 1):
+    for s in dfl["tss"].unique():
         test = dfl["tss"].values == s
         train = dfl[~test]
-        ta = sample(build_model_a(train, gene_cols, p0=p0), draws, tune, chains, target_accept)
-        tb = sample(build_model_b(train, gene_cols, p0=p0), draws, tune, chains, target_accept)
-        bA = ta.posterior["beta"].mean(("chain", "draw")).values
-        bB = tb.posterior["beta"].mean(("chain", "draw")).values
-        eta_a[test] = Xall[test] @ bA
-        eta_b[test] = Xall[test] @ bB
-        log.info("    LOSO site %s (%d/%d)", s, k, len(sites))
+        ta = sample(build_model_a(train, gene_cols, time_col, event_col, p0), draws, draws, chains, target_accept)
+        tb = sample(build_model_b(train, gene_cols, time_col, event_col, p0), draws, draws, chains, target_accept)
+        eta_a[test] = Xall[test] @ ta.posterior["beta"].mean(("chain", "draw")).values
+        eta_b[test] = Xall[test] @ tb.posterior["beta"].mean(("chain", "draw")).values
     return c_index(t, e, eta_a), c_index(t, e, eta_b)
 
 
-# ----------------------------------------------------------------------------
-# per-cohort driver
-# ----------------------------------------------------------------------------
-def run_cohort(cohort, args):
-    t0 = time.time()
-    parquet = prepare_cohort(cohort)
-    df = pd.read_parquet(parquet)
-    dfl = _valid(df)
-    n_deaths = int(dfl["OS"].sum())
-    if n_deaths < args.min_events:
-        log.warning("[%s] only %d deaths (< %d) — skipping", cohort, n_deaths, args.min_events)
-        return {"cohort": cohort, "status": "skip_low_events", "n_deaths": n_deaths}
+def combat_correct(df, gene_cols, batch_col="tss"):
+    """ComBat-correct the gene block by TSS batch. Drops singleton-site patients
+    (ComBat cannot estimate a batch effect from one sample)."""
+    from inmoose.pycombat import pycombat_norm
+    counts = df[batch_col].value_counts()
+    sub = df[df[batch_col].isin(counts[counts >= 2].index)].copy()
+    sub[gene_cols] = pycombat_norm(sub[gene_cols].T.values, sub[batch_col].values).T
+    return sub
 
-    gene_cols = hallmark_gene_cols(cohort, df)
-    Xb = dfl[gene_cols].values
-    log.info("[%s] n=%d deaths=%d sites=%d genes=%d",
-             cohort, len(dfl), n_deaths, dfl["tss"].nunique(), len(gene_cols))
 
-    trace_a = sample(build_model_a(df, gene_cols, args.p0), args.draws, args.tune, args.chains, args.target_accept)
-    trace_b = sample(build_model_b(df, gene_cols, args.p0), args.draws, args.tune, args.chains, args.target_accept)
-    trace_a.to_netcdf(TRACE_DIR / f"{cohort}_A.nc")
-    trace_b.to_netcdf(TRACE_DIR / f"{cohort}_B.nc")
+# ----------------------------------------------------------------------------
+# one (endpoint, panel) run
+# ----------------------------------------------------------------------------
+def _safe(name: str) -> str:
+    return name.replace(":", "").replace("+", "_")
+
+
+def analyze(cohort, df, endpoint, panel, gene_cols, args, combat=False):
+    tc, ec = f"{endpoint}_time", endpoint
+    if combat:
+        df = combat_correct(df, gene_cols)
+    dfv = _valid(df, tc, ec)
+    Xb = dfv[gene_cols].values
+
+    ta = sample(build_model_a(df, gene_cols, tc, ec, args.p0), args.draws, args.tune, args.chains, args.target_accept)
+    tb = sample(build_model_b(df, gene_cols, tc, ec, args.p0), args.draws, args.tune, args.chains, args.target_accept)
+    if not args.no_traces:
+        tdir = cohort_dir(cohort) / "traces"
+        tag = f"{endpoint}_{_safe(panel)}"
+        ta.to_netcdf(tdir / f"model_a_{tag}.nc")
+        tb.to_netcdf(tdir / f"model_b_{tag}.nc")
 
     row = {
-        "cohort": cohort, "status": "ok",
-        "n_patients": len(dfl), "n_deaths": n_deaths,
-        "n_sites": int(dfl["tss"].nunique()), "n_genes": len(gene_cols),
-        "div_A": int(trace_a.sample_stats.diverging.sum()),
-        "div_B": int(trace_b.sample_stats.diverging.sum()),
-        "hits_A": gene_hits(trace_a), "hits_B": gene_hits(trace_b),
+        "cohort": cohort, "endpoint": endpoint, "panel": panel, "status": "ok",
+        "n_patients": len(dfv), "n_events": int(dfv[ec].sum()),
+        "n_sites": int(dfv["tss"].nunique()), "n_genes": len(gene_cols),
+        "div_A": int(ta.sample_stats.diverging.sum()),
+        "div_B": int(tb.sample_stats.diverging.sum()),
+        "hits_A": gene_hits(ta), "hits_B": gene_hits(tb),
     }
-    row.update(icc_decomposition(trace_b, Xb))
-
+    row.update(icc_decomposition(tb, Xb))
     if args.loso:
-        cA, cB = loso_cindex(df, gene_cols, args.p0, args.loso_draws,
-                             args.loso_draws, 2, args.target_accept)
-        row["cindex_A"] = cA
-        row["cindex_B"] = cB
-        row["cindex_gap"] = cB - cA
-
-    row["minutes"] = round((time.time() - t0) / 60, 1)
-    log.info("[%s] ICC_site=%.3f [%.3f, %.3f]  ICC_genomic=%.3f  (%.1f min)",
-             cohort, row["ICC_site_mean"], row["ICC_site_lo"], row["ICC_site_hi"],
-             row["ICC_genomic_mean"], row["minutes"])
+        cA, cB = loso_cindex(df, gene_cols, tc, ec, args.p0, args.loso_draws, 2, args.target_accept)
+        row["cindex_A"], row["cindex_B"], row["cindex_gap"] = cA, cB, cB - cA
     return row
 
 
-def append_summary(row: dict):
-    df_row = pd.DataFrame([row])
-    if SUMMARY_CSV.exists():
-        prev = pd.read_csv(SUMMARY_CSV)
-        prev = prev[prev["cohort"] != row["cohort"]]   # replace any old row for this cohort
-        df_row = pd.concat([prev, df_row], ignore_index=True)
-    df_row.to_csv(SUMMARY_CSV, index=False)
-
-
-def done_cohorts() -> set:
-    if not SUMMARY_CSV.exists():
-        return set()
-    s = pd.read_csv(SUMMARY_CSV)
-    return set(s.loc[s["status"] == "ok", "cohort"])
+def run_cohort(cohort, args, done):
+    prepare_cohort(cohort)
+    df = pd.read_parquet(cohort_dir(cohort) / f"{cohort}.parquet")
+    rows = []
+    for endpoint in args.endpoints:
+        tc, ec = f"{endpoint}_time", endpoint
+        n_ev = int(_valid(df, tc, ec)[ec].sum())
+        if n_ev < args.min_events:
+            log.warning("[%s/%s] only %d events (< %d) — skipping endpoint", cohort, endpoint, n_ev, args.min_events)
+            append_cohort_result(cohort, {"cohort": cohort, "endpoint": endpoint, "panel": "-",
+                                          "status": f"skip_low_events({n_ev})"})
+            continue
+        panels = list(args.panels) + (["hallmark+combat"] if args.combat else [])
+        for panel in panels:
+            if (cohort, endpoint, panel) in done:
+                log.info("[%s/%s/%s] already done — skipping", cohort, endpoint, panel)
+                continue
+            t0 = time.time()
+            try:
+                gene_cols = select_genes(cohort, df, "hallmark" if panel == "hallmark+combat" else panel)
+                row = analyze(cohort, df, endpoint, panel, gene_cols, args,
+                              combat=(panel == "hallmark+combat"))
+                row["minutes"] = round((time.time() - t0) / 60, 1)
+                log.info("[%s/%s/%s] ICC_site=%.3f [%.3f,%.3f] genomic=%.3f hits=%d (%.1f min)",
+                         cohort, endpoint, panel, row["ICC_site_mean"], row["ICC_site_lo"],
+                         row["ICC_site_hi"], row["ICC_genomic_mean"], row["hits_B"], row["minutes"])
+            except Exception as exc:
+                log.exception("[%s/%s/%s] FAILED: %s", cohort, endpoint, panel, exc)
+                row = {"cohort": cohort, "endpoint": endpoint, "panel": panel,
+                       "status": f"error: {type(exc).__name__}: {exc}"}
+            append_cohort_result(cohort, row)
+            rows.append(row)
+    return rows
 
 
 # ----------------------------------------------------------------------------
+# bookkeeping — per-cohort results.csv is the source of truth; global is derived
+# ----------------------------------------------------------------------------
+def append_cohort_result(cohort: str, row: dict):
+    path = cohort_dir(cohort) / "results.csv"
+    new = pd.DataFrame([row])
+    if path.exists():
+        prev = pd.read_csv(path)
+        mask = ~(prev[KEY].astype(str).agg("|".join, axis=1)
+                 == "|".join(str(row.get(k, "")) for k in KEY))
+        new = pd.concat([prev[mask], new], ignore_index=True)
+    new.to_csv(path, index=False)
+    rebuild_global_summary()
+
+
+def rebuild_global_summary():
+    """results/pan_cancer_summary.csv = concat of every data/processed/*/results.csv.
+    Purely derived — safe to delete and regenerate from data/processed/ alone."""
+    parts = [pd.read_csv(p) for p in sorted(PROCESSED_DIR.glob("*/results.csv"))]
+    if parts:
+        pd.concat(parts, ignore_index=True).to_csv(SUMMARY_CSV, index=False)
+
+
+def done_combos() -> set:
+    """Resume set read from per-cohort results.csv under data/processed/."""
+    done = set()
+    for p in PROCESSED_DIR.glob("*/results.csv"):
+        s = pd.read_csv(p)
+        s = s[s["status"] == "ok"]
+        done |= set(zip(s["cohort"], s["endpoint"], s["panel"]))
+    return done
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--cohorts", nargs="*", default=ALL_TCGA, help="cohort codes (default: all 33 TCGA)")
-    ap.add_argument("--p0", type=int, default=10, help="prior guess for # relevant genes")
+    ap.add_argument("--cohorts", nargs="*", default=ALL_TCGA)
+    ap.add_argument("--endpoints", nargs="*", default=["PFI", "OS"],
+                    help="survival endpoints; first is primary (default: PFI OS)")
+    ap.add_argument("--panels", nargs="*", default=["hallmark"],
+                    help="gene panels: 'hallmark' and/or 'topvar:N' (e.g. topvar:500 topvar:2000)")
+    ap.add_argument("--combat", action="store_true", help="add a ComBat (TSS-corrected) sensitivity run per endpoint")
+    ap.add_argument("--p0", type=int, default=10)
     ap.add_argument("--draws", type=int, default=1000)
     ap.add_argument("--tune", type=int, default=1000)
     ap.add_argument("--chains", type=int, default=4)
     ap.add_argument("--target-accept", type=float, default=0.99)
     ap.add_argument("--loso", action="store_true", help="also run leave-one-site-out C-index (slow)")
-    ap.add_argument("--loso-draws", type=int, default=500, help="draws/tune per LOSO fold fit")
-    ap.add_argument("--min-events", type=int, default=50, help="skip cohorts with fewer OS deaths")
-    ap.add_argument("--force", action="store_true", help="recompute cohorts already marked ok")
+    ap.add_argument("--loso-draws", type=int, default=500)
+    ap.add_argument("--no-traces", action="store_true",
+                    help="skip saving .nc traces (results.csv still written; saves disk)")
+    ap.add_argument("--min-events", type=int, default=50)
+    ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO, stream=sys.stdout,
-        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S",
-    )
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout,
+                        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 
-    done = set() if args.force else done_cohorts()
-    todo = [c for c in args.cohorts if c not in done]
-    log.info("cohorts: %d requested, %d already done, %d to run", len(args.cohorts), len(done), len(todo))
+    done = set() if args.force else done_combos()
+    log.info("cohorts=%d endpoints=%s panels=%s combat=%s loso=%s (%d combos already done)",
+             len(args.cohorts), args.endpoints, args.panels, args.combat, args.loso, len(done))
 
-    for cohort in todo:
+    for cohort in args.cohorts:
         try:
-            row = run_cohort(cohort, args)
-        except Exception as exc:  # isolate failures so one bad cohort doesn't kill the run
-            log.exception("[%s] FAILED: %s", cohort, exc)
-            row = {"cohort": cohort, "status": f"error: {type(exc).__name__}: {exc}"}
-        append_summary(row)
+            run_cohort(cohort, args, done)
+        except Exception as exc:
+            log.exception("[%s] cohort-level FAILED: %s", cohort, exc)
+            append_cohort_result(cohort, {"cohort": cohort, "endpoint": "-", "panel": "-",
+                                          "status": f"error: {type(exc).__name__}: {exc}"})
 
-    log.info("all done -> %s", SUMMARY_CSV)
+    rebuild_global_summary()
+    log.info("all done -> %s (per-cohort source of truth in data/processed/<cohort>/results.csv)", SUMMARY_CSV)
 
 
 if __name__ == "__main__":
