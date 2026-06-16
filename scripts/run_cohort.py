@@ -54,7 +54,7 @@ ALL_TCGA = [
     "TGCT", "THCA", "THYM", "UCEC", "UCS", "UVM",
 ]
 ENDPOINTS_ALL = ["OS", "OS_time", "DSS", "DSS_time", "PFI", "PFI_time", "DFI", "DFI_time"]
-KEY = ["cohort", "endpoint", "panel"]
+KEY = ["cohort", "endpoint", "panel", "p0"]
 
 log = logging.getLogger("run_cohort")
 
@@ -316,12 +316,12 @@ def analyze(cohort, df, endpoint, panel, gene_cols, args, combat=False):
     tb = sample(build_model_b(df, gene_cols, tc, ec, args.p0), args.draws, args.tune, args.chains, args.target_accept)
     if not args.no_traces:
         tdir = cohort_dir(cohort) / "traces"
-        tag = f"{endpoint}_{_safe(panel)}"
+        tag = f"{endpoint}_{_safe(panel)}_p{args.p0}"
         ta.to_netcdf(tdir / f"model_a_{tag}.nc")
         tb.to_netcdf(tdir / f"model_b_{tag}.nc")
 
     row = {
-        "cohort": cohort, "endpoint": endpoint, "panel": panel, "status": "ok",
+        "cohort": cohort, "endpoint": endpoint, "panel": panel, "p0": args.p0, "status": "ok",
         "n_patients": len(dfv), "n_events": int(dfv[ec].sum()),
         "n_sites": int(dfv["tss"].nunique()), "n_genes": len(gene_cols),
         "div_A": int(ta.sample_stats.diverging.sum()),
@@ -345,11 +345,11 @@ def run_cohort(cohort, args, done):
         if n_ev < args.min_events:
             log.warning("[%s/%s] only %d events (< %d) — skipping endpoint", cohort, endpoint, n_ev, args.min_events)
             append_cohort_result(cohort, {"cohort": cohort, "endpoint": endpoint, "panel": "-",
-                                          "status": f"skip_low_events({n_ev})"})
+                                          "p0": args.p0, "status": f"skip_low_events({n_ev})"})
             continue
         panels = list(args.panels) + (["hallmark+combat"] if args.combat else [])
         for panel in panels:
-            if (cohort, endpoint, panel) in done:
+            if (cohort, endpoint, panel, args.p0) in done:
                 log.info("[%s/%s/%s] already done — skipping", cohort, endpoint, panel)
                 continue
             t0 = time.time()
@@ -363,7 +363,7 @@ def run_cohort(cohort, args, done):
                          row["ICC_site_hi"], row["ICC_genomic_mean"], row["hits_B"], row["minutes"])
             except Exception as exc:
                 log.exception("[%s/%s/%s] FAILED: %s", cohort, endpoint, panel, exc)
-                row = {"cohort": cohort, "endpoint": endpoint, "panel": panel,
+                row = {"cohort": cohort, "endpoint": endpoint, "panel": panel, "p0": args.p0,
                        "status": f"error: {type(exc).__name__}: {exc}"}
             append_cohort_result(cohort, row)
             rows.append(row)
@@ -378,6 +378,9 @@ def append_cohort_result(cohort: str, row: dict):
     new = pd.DataFrame([row])
     if path.exists():
         prev = pd.read_csv(path)
+        for k in KEY:                       # tolerate legacy files written before a key column existed
+            if k not in prev.columns:
+                prev[k] = ""
         mask = ~(prev[KEY].astype(str).agg("|".join, axis=1)
                  == "|".join(str(row.get(k, "")) for k in KEY))
         new = pd.concat([prev[mask], new], ignore_index=True)
@@ -399,7 +402,10 @@ def done_combos() -> set:
     for p in PROCESSED_DIR.glob("*/results.csv"):
         s = pd.read_csv(p)
         s = s[s["status"] == "ok"]
-        done |= set(zip(s["cohort"], s["endpoint"], s["panel"]))
+        if "p0" not in s.columns:        # legacy rows predate the p0 key — recompute them under it
+            continue
+        for _, r in s.iterrows():
+            done.add((r["cohort"], r["endpoint"], r["panel"], int(r["p0"])))
     return done
 
 
@@ -428,8 +434,8 @@ def main():
                         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 
     done = set() if args.force else done_combos()
-    log.info("cohorts=%d endpoints=%s panels=%s combat=%s loso=%s (%d combos already done)",
-             len(args.cohorts), args.endpoints, args.panels, args.combat, args.loso, len(done))
+    log.info("cohorts=%d endpoints=%s panels=%s p0=%d combat=%s loso=%s (%d combos already done)",
+             len(args.cohorts), args.endpoints, args.panels, args.p0, args.combat, args.loso, len(done))
 
     for cohort in args.cohorts:
         try:
@@ -437,7 +443,7 @@ def main():
         except Exception as exc:
             log.exception("[%s] cohort-level FAILED: %s", cohort, exc)
             append_cohort_result(cohort, {"cohort": cohort, "endpoint": "-", "panel": "-",
-                                          "status": f"error: {type(exc).__name__}: {exc}"})
+                                          "p0": args.p0, "status": f"error: {type(exc).__name__}: {exc}"})
 
     rebuild_global_summary()
     log.info("all done -> %s (per-cohort source of truth in data/processed/<cohort>/results.csv)", SUMMARY_CSV)
