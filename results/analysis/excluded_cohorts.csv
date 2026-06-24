@@ -1,0 +1,4 @@
+cohort,endpoint,max_rhat_scalar,min_ess_scalar
+SARC,PFI,1.0562,53.4988
+BLCA,PFI,1.0391,96.1142
+PAAD,PFI,1.0356,97.0907

@@ -281,6 +281,15 @@ def main():
             print(f"validation skipped ({type(exc).__name__}: {exc})")
 
     recs = discover(set(args.cohorts) if args.cohorts else None)
+    # ComBat/dropsing fits use a corrected / singleton-dropped design matrix that CANNOT be
+    # reconstructed from the parquet (which is the full, uncorrected expression), so a parquet-
+    # based pointwise log-likelihood would be wrong (and the wrong length). Skip them — LOO is a
+    # hallmark/topvar Model-A-vs-B comparison only.
+    skipped_panel = [r for r in recs if "+combat" in r["panel"] or "+dropsing" in r["panel"]]
+    recs = [r for r in recs if r not in skipped_panel]
+    if skipped_panel:
+        print(f"skipping {len(skipped_panel)} combat/dropsing traces (corrected design matrix "
+              f"not reconstructible from parquet; LOO is hallmark/topvar only)")
     print(f"discovered {len(recs)} traces")
     results = []
     for rec in recs:

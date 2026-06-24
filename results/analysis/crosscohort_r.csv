@@ -1,0 +1,4 @@
+relationship,r_full,n_full,r_clean,n_clean,n_excluded
+ICC_genomic vs out-of-sample C-index (Model B),0.767,39,0.875,36,3
+ICC_site vs out-of-sample C-index (Model B),-0.142,39,-0.155,36,3
+ICC_site OS vs PFI (paired),0.487,18,0.527,15,3

@@ -408,9 +408,20 @@ def make_folds(df, event_col, cv_folds):
     return [[s] for s in sorted(df["tss"].unique())]
 
 
+def drop_singleton_sites(df, batch_col="tss"):
+    """Apply the SAME site filter ComBat uses (sites with >=2 samples) but WITHOUT batch
+    correction. This is the matched baseline for the ComBat sensitivity comparison: comparing
+    ComBat against the full original run conflates the correction with the dropped patients
+    (ComBat removes whole singleton sites, which itself moves ICC_site). Comparing
+    hallmark+combat against hallmark+dropsing isolates ComBat's effect on the identical set."""
+    counts = df[batch_col].value_counts()
+    return df[df[batch_col].isin(counts[counts >= 2].index)].copy()
+
+
 def combat_correct(df, gene_cols, batch_col="tss"):
     """ComBat-correct the gene block by TSS batch. Drops singleton-site patients
-    (ComBat cannot estimate a batch effect from one sample)."""
+    (ComBat cannot estimate a batch effect from one sample) — the SAME rows
+    drop_singleton_sites keeps, so the two are a matched corrected/uncorrected pair."""
     from inmoose.pycombat import pycombat_norm
     counts = df[batch_col].value_counts()
     sub = df[df[batch_col].isin(counts[counts >= 2].index)].copy()
@@ -425,10 +436,12 @@ def _safe(name: str) -> str:
     return name.replace(":", "").replace("+", "_")
 
 
-def analyze(cohort, df, endpoint, panel, gene_cols, args, combat=False):
+def analyze(cohort, df, endpoint, panel, gene_cols, args):
     tc, ec = f"{endpoint}_time", endpoint
-    if combat:
-        df = combat_correct(df, gene_cols)
+    if panel == "hallmark+combat":
+        df = combat_correct(df, gene_cols)          # singleton-dropped + ComBat-corrected
+    elif panel == "hallmark+dropsing":
+        df = drop_singleton_sites(df)               # singleton-dropped, UNCORRECTED (matched baseline)
     dfv = _valid(df, tc, ec)
     Xb = dfv[gene_cols].values
 
@@ -469,16 +482,18 @@ def run_cohort(cohort, args, done):
             append_cohort_result(cohort, {"cohort": cohort, "endpoint": endpoint, "panel": "-",
                                           "p0": args.p0, "status": f"skip_low_events({n_ev})"})
             continue
-        panels = list(args.panels) + (["hallmark+combat"] if args.combat else [])
+        # --combat adds the matched baseline (singleton-dropped, UNCORRECTED) AND the corrected
+        # run, so ICC change can be attributed to ComBat rather than the dropped singleton sites.
+        panels = list(args.panels) + (["hallmark+dropsing", "hallmark+combat"] if args.combat else [])
         for panel in panels:
             if (cohort, endpoint, panel, args.p0) in done:
                 log.info("[%s/%s/%s] already done — skipping", cohort, endpoint, panel)
                 continue
             t0 = time.time()
             try:
-                gene_cols = select_genes(cohort, df, "hallmark" if panel == "hallmark+combat" else panel)
-                row = analyze(cohort, df, endpoint, panel, gene_cols, args,
-                              combat=(panel == "hallmark+combat"))
+                base_panel = "hallmark" if panel in ("hallmark+combat", "hallmark+dropsing") else panel
+                gene_cols = select_genes(cohort, df, base_panel)
+                row = analyze(cohort, df, endpoint, panel, gene_cols, args)
                 row["minutes"] = round((time.time() - t0) / 60, 1)
                 log.info("[%s/%s/%s] ICC_site=%.3f [%.3f,%.3f] genomic=%.3f hits=%d (%.1f min)",
                          cohort, endpoint, panel, row["ICC_site_mean"], row["ICC_site_lo"],
